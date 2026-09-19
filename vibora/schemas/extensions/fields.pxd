@@ -7,6 +7,7 @@ cdef class Field:
         public bint is_async
         public str load_from
         public str load_into
+        public str source
         object default
         public bint required
         bint default_callable
@@ -35,3 +36,9 @@ cdef class List(Field):
 
 cdef class Nested(Field):
     pass
+
+
+cdef class File(Field):
+    cdef:
+        object allowed_mime_types
+        object max_size

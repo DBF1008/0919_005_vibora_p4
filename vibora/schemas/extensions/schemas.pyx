@@ -3,13 +3,28 @@ from typing import List as TList, Dict
 from vibora.request import Request
 from collections import defaultdict
 from .validator import Validator
-from .fields cimport Field, String, Integer, Number, Nested, List
+from .fields cimport Field, String, Integer, Number, Nested, List, File
+from .fields import BODY, QUERY, PATH, DEFAULT_SOURCE
 from ..messages import Messages, EnglishLanguage
 from ..exceptions import ValidationError, InvalidSchema
 
 
-optimized_fields = (String, Integer, List, Number, Nested)
+optimized_fields = (String, Integer, List, Number, Nested, File)
 type_index = {str: String, int: Integer, float: Number, TList: List}
+
+
+def _flatten_params(params) -> dict:
+    """Flattens query-string style params ({'key': ['value']}) into a
+    plain dict taking the first value of every key."""
+    values = {}
+    for key, value in params.items():
+        if isinstance(value, (list, tuple)):
+            if value:
+                values[key] = value[0]
+        else:
+            values[key] = value
+    return values
+
 
 
 class SchemaCreator(type):
@@ -120,27 +135,42 @@ class Schema(metaclass=SchemaCreator):
                                   'this validation.')
 
     @classmethod
-    async def load(cls, dict values, dict language=EnglishLanguage, dict context=None) -> 'Schema':
-        """
+    async def load(cls, dict values, dict language=EnglishLanguage, dict context=None,
+                   dict sources=None) -> 'Schema':
+        """Loads and validates data into the schema.
 
-        :param context:
-        :param values:
-        :param language:
-        :return:
+        Backward compatible signature: when ``sources`` is not provided every
+        field is read straight from ``values`` (historical behaviour). When it
+        is provided, each field is routed to its declared input source
+        (``body`` / ``query`` / ``path``) using ``load_from`` as the lookup
+        key inside that source.
         """
         cdef Field field
         cdef dict errors
+        cdef dict source_values
+        cdef bint routed
+        routed = sources is not None
         if context is None:
             context = {}
         instance = cls(silent=True)
         errors = {}
         for field in cls._fields:
-            if field.load_from in values:
+            present = False
+            raw_value = None
+            if routed:
+                source_values = sources.get(field.source or DEFAULT_SOURCE)
+                if source_values is not None and field.load_from in source_values:
+                    present = True
+                    raw_value = source_values[field.load_from]
+            elif field.load_from in values:
+                present = True
+                raw_value = values[field.load_from]
+            if present:
                 try:
                     if field.is_async:
-                        value = await field.pipeline(values[field.load_from], context)
+                        value = await field.pipeline(raw_value, context)
                     else:
-                        value = field.sync_pipeline(values[field.load_from], context)
+                        value = field.sync_pipeline(raw_value, context)
                 except ValidationError as error:
                     add_error(errors, error.field or field.load_from, error)
                 else:
@@ -175,6 +205,53 @@ class Schema(metaclass=SchemaCreator):
         :return:
         """
         return await cls.load(await request.json(), language=language, context=context)
+
+    @classmethod
+    async def load_query(cls, request: Request, language: dict=EnglishLanguage,
+                         context: dict=None, dict path_values=None):
+        """Loads fields declared with ``source=QUERY`` (and optionally
+        ``source=PATH``) from the URL query string."""
+        query_values = _flatten_params(request.args.values)
+        sources = {QUERY: query_values, BODY: {}}
+        if path_values is not None:
+            sources[PATH] = path_values
+        return await cls.load(query_values, language=language, context=context, sources=sources)
+
+    @classmethod
+    async def load_path(cls, request: Request, language: dict=EnglishLanguage,
+                        context: dict=None, dict path_values=None,
+                        bint include_query=False):
+        """Loads fields declared with ``source=PATH`` from the route
+        parameters. Path parameters are injected into the route handler as
+        keyword arguments by the router, so forward them through
+        ``path_values``. Query-sourced fields are supported when
+        ``include_query`` is True."""
+        path_values = path_values or {}
+        sources = {PATH: path_values, BODY: {}}
+        if include_query:
+            sources[QUERY] = _flatten_params(request.args.values)
+        return await cls.load(path_values, language=language, context=context, sources=sources)
+
+    @classmethod
+    async def load_request(cls, request: Request, language: dict=EnglishLanguage,
+                           context: dict=None, dict path_values=None):
+        """Routes every field automatically based on its declared ``source``
+        attribute: body (JSON or multipart form), URL query string or path
+        parameters."""
+        content_type = request.headers.get('Content-Type') or ''
+        if 'multipart/form-data' in content_type:
+            body_values = await request.form()
+        elif content_type:
+            body_values = await request.json()
+        else:
+            body_values = {}
+        query_values = _flatten_params(request.args.values)
+        sources = {
+            BODY: body_values,
+            QUERY: query_values,
+            PATH: path_values or {}
+        }
+        return await cls.load(body_values, language=language, context=context, sources=sources)
 
     async def after_load(self):
         """

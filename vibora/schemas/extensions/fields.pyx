@@ -1,16 +1,28 @@
+import mimetypes
+import os
 from ..exceptions import ValidationError, NestedValidationError
 from ..messages import Messages
+from ...multipart import UploadedFile, MemoryFile, DiskFile
 from .validator cimport Validator
+
+
+# Input source identifiers used by Schema.load() to route each field
+# to the data source it must be extracted from.
+BODY = 'body'
+QUERY = 'query'
+PATH = 'path'
+DEFAULT_SOURCE = BODY
 
 
 cdef class Field:
     def __init__(self, bint required=True, object default=None, list validators=None,
-                 bint strict=False, str load_from=None):
+                 bint strict=False, str load_from=None, str source=DEFAULT_SOURCE):
         self.validators = validators or []
         self.strict = strict
         self.is_async = False
         self.load_from = load_from
         self.load_into = None
+        self.source = source
         self.default = default
         self.required = required if default is None else False
         self.default_callable = callable(self.default)
@@ -187,3 +199,108 @@ cdef class Nested(Field):
         if self.validators:
             self._call_validators(value, context)
         return value
+
+cdef class File(Field):
+
+    def __init__(self, allowed_mime_types=None, object max_size=10 * 1024 * 1024,
+                 bint required=True, object default=None, list validators=None,
+                 str load_from=None, str source=DEFAULT_SOURCE):
+        super().__init__(required=required, default=default, validators=validators,
+                         load_from=load_from, source=source)
+        self.allowed_mime_types = None
+        if allowed_mime_types is not None:
+            self.allowed_mime_types = []
+            for mime_type in allowed_mime_types:
+                if '/' not in mime_type:
+                    raise ValueError('Invalid MIME type "{0}".'.format(mime_type))
+                self.allowed_mime_types.append(mime_type.lower())
+        self.max_size = max_size
+
+    cdef load(self, value):
+        if not isinstance(value, UploadedFile):
+            raise ValidationError(
+                'Field "{0}" expects a file uploaded through multipart/form-data.'.format(self.load_from),
+                field=self.load_from
+            )
+        if self.allowed_mime_types is not None:
+            guessed_mime_type, _ = mimetypes.guess_type(value.filename or '')
+            if guessed_mime_type is None or guessed_mime_type.lower() not in self.allowed_mime_types:
+                raise ValidationError(
+                    'File type "{0}" is not allowed. Allowed types: {1}.'.format(
+                        guessed_mime_type or 'application/octet-stream',
+                        ', '.join(self.allowed_mime_types)
+                    ),
+                    field=self.load_from
+                )
+        size = _uploaded_file_size(value)
+        if self.max_size is not None and size is not None and size > self.max_size:
+            raise ValidationError(
+                'File "{0}" exceeds the maximum allowed size of {1} bytes (got {2} bytes).'.format(
+                    value.filename, self.max_size, size
+                ),
+                field=self.load_from
+            )
+        return UploadedFileValue(value)
+
+
+def _uploaded_file_size(value):
+    """Best-effort size retrieval for the uploaded file objects exposed by
+    the multipart parser without forcing the content to be consumed."""
+    if isinstance(value, MemoryFile):
+        return len(value.f)
+    if isinstance(value, DiskFile):
+        try:
+            return os.path.getsize(value.temporary_path)
+        except OSError:
+            return None
+    return None
+
+
+class UploadedFileValue:
+    """File metadata plus a reference to the underlying content stream
+    produced by a multipart/form-data upload."""
+
+    def __init__(self, file):
+        self.file = file
+        self.filename = file.filename
+        self.size = _uploaded_file_size(file)
+
+    @property
+    def content_type(self):
+        guessed, _ = mimetypes.guess_type(self.filename or '')
+        return guessed or 'application/octet-stream'
+
+    async def read(self, count: int=0) -> bytes:
+        return await self.file.read(count)
+
+    async def save(self, destination: str):
+        return await self.file.save(destination)
+
+    def seek(self, pos):
+        self.file.seek(pos)
+        return self
+
+    def __aiter__(self):
+        # Default 1 MiB chunk size; call .chunks(size) explicitly to override.
+        return UploadedFileChunks(self, 1024 * 1024)
+
+    def chunks(self, chunk_size: int=1024 * 1024):
+        return UploadedFileChunks(self, chunk_size)
+
+
+class UploadedFileChunks:
+    """Async iterator over the uploaded file content without loading the
+    whole payload into memory."""
+
+    def __init__(self, uploaded_file, chunk_size: int):
+        self.uploaded_file = uploaded_file
+        self.chunk_size = chunk_size
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        chunk = await self.uploaded_file.file.read(self.chunk_size)
+        if not chunk:
+            raise StopAsyncIteration
+        return chunk
